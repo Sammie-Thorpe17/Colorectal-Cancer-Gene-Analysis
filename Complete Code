@@ -1,0 +1,838 @@
+###################
+## PACKAGES ##
+###################
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+if (!requireNamespace("ranger", quietly = TRUE)) install.packages("ranger")
+if (!requireNamespace("e1071", quietly = TRUE)) install.packages("e1071")
+if (!requireNamespace("kernelshap", quietly = TRUE)) install.packages("kernelshap")
+if (!requireNamespace("shapviz", quietly = TRUE)) install.packages("shapviz")
+if (!requireNamespace("treeshap", quietly = TRUE)) install.packages("treeshap")
+
+library(readr)
+library(dplyr)
+library(tibble)
+library(stringr)
+library(tidyr)
+library(org.Hs.eg.db)
+library(caret)
+library(ranger)
+library(e1071)
+library(pROC)
+library(ggplot2)
+library(kernelshap)
+library(shapviz)
+library(treeshap)
+library(openxlsx)
+
+###################
+## CONFIG / PATHS ##
+###################
+
+counts_file <- "TCGA-COAD.star_counts (1).tsv"
+pheno_file  <- "TCGA-COAD.clinical (1).tsv"
+
+N_TOP_GENES <- 2000   # number of high-variance genes to keep
+SEED        <- 42
+
+NTREE    <- 500       # plataeu value 
+CV_FOLDS <- 5 
+
+# grid search: some values taken from papers 
+GRID_MAX_DEPTH     <- c(6, 12, 20)
+GRID_MIN_NODE_SIZE <- c(6, 10, 20) 
+GRID_MTRY          <- c(22, 45, 90) 
+
+CLASS_WEIGHT <- "balanced"
+
+# SVM grid search
+SVM_KERNELS <- c("linear", "radial", "polynomial")
+SVM_COST    <- c(1, 5, 10)  # setting the value barriers 
+SVM_GAMMA   <- c(0.0001, 0.0005, 0.001)   # setting the curviture for radial
+
+# SHAP explainability
+SHAP_N_GENES <- 20   # explain the top-N genes (by RF impurity importance)
+SHAP_BG_SIZE <- 50   # background sample size for Kernel SHAP
+
+META_COLS <- c("sample", "stage_binary",
+               "ajcc_pathologic_stage", "ajcc_pathologic_stage.diagnoses")
+
+###################
+## LOADING THE DATA ##
+###################
+
+COAD_genes <- read_tsv(counts_file, show_col_types = FALSE)
+COAD_pheno <- read_tsv(pheno_file,  show_col_types = FALSE)
+
+###################
+## CHECKING LOG2 ##
+###################
+
+m <- as.matrix(COAD_genes[, -1])
+m <- matrix(as.numeric(m), nrow = nrow(m))
+
+cat("Max value :", round(max(m, na.rm = TRUE), 3), "\n")
+cat("Fraction whole numbers:", round(mean(m == round(m), na.rm = TRUE), 3), "\n")
+print(head(sort(unique(m[m > 0])), 8))  
+
+range(m, na.rm = TRUE)
+quantile(m,
+         probs = c(0, 0.25, 0.5, 0.75, 1),
+         na.rm = TRUE)
+
+###################
+## TRANSPOSE AND JOIN ##
+###################
+
+# identify the column titles
+gene_col_name <- colnames(COAD_genes)[1]
+
+# Transpose: 
+expr_t <- COAD_genes %>%
+  column_to_rownames(var = gene_col_name) %>%
+  t() %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = "sample")
+
+final_dataset <- inner_join(expr_t, COAD_pheno, by = "sample")
+
+final_dataset_cleaned <- final_dataset %>%
+  dplyr::select(sample, starts_with("ENSG"), ajcc_pathologic_stage.diagnoses)
+
+###################
+## BINARY STAGE LABEL ##
+###################
+
+final_dataset_cleaned <- final_dataset_cleaned %>%
+  mutate(
+    stage_roman = str_extract(ajcc_pathologic_stage.diagnoses, "IV|III|II|I"),
+    stage_binary = case_when(
+      stage_roman %in% c("III", "IV") ~ "Late",
+      stage_roman %in% c("I", "II") ~ "Early",
+      TRUE ~ NA_character_)) %>%
+  dplyr::select(-stage_roman)
+
+final_dataset_no_na <- final_dataset_cleaned %>%
+  filter(!is.na(stage_binary))
+
+###################
+## CLEAN ENSEMBL IDS ##
+###################
+
+clean_cols <- colnames(final_dataset_no_na)
+
+is_gene <- grepl("ENSG", clean_cols, ignore.case = TRUE) # finds the columns for gsub to clean
+clean_cols[is_gene] <- gsub("^X(?=ENSG)", "", clean_cols[is_gene],
+                            ignore.case = TRUE, perl = TRUE)
+clean_cols[is_gene] <- gsub("\\..*", "", clean_cols[is_gene])  # drop .1 / .12 version
+
+colnames(final_dataset_no_na) <- clean_cols
+
+###################
+## ENSURE EXPRESSION IS NUMERIC ##
+###################
+
+ensembl_cols <- grep("^ENSG", colnames(final_dataset_no_na), value = TRUE)
+
+for (col in ensembl_cols) {
+  final_dataset_no_na[[col]] <- as.numeric(as.character(final_dataset_no_na[[col]]))}
+
+dataset_expr <- final_dataset_no_na %>%
+  dplyr::select(sample, stage_binary, ajcc_pathologic_stage.diagnoses,
+                all_of(ensembl_cols))
+
+###################
+## MAP ENSEMBL -> SYMBOL ##
+###################
+
+annots <- AnnotationDbi::select(org.Hs.eg.db,
+                                keys = ensembl_cols,
+                                columns = "SYMBOL",
+                                keytype = "ENSEMBL")
+annots_unique <- annots[!duplicated(annots$ENSEMBL), ] # removal of duplicates 
+
+# gene_lookup: ensembl_id -> symbol (NA where unmapped)
+gene_lookup <- setNames(annots_unique$SYMBOL, annots_unique$ENSEMBL)
+
+# Identify gene columns that DID convert 
+mapped_ids <- ensembl_cols[
+  !is.na(gene_lookup[ensembl_cols]) & gene_lookup[ensembl_cols] != ""
+]
+dropped_n <- length(ensembl_cols) - length(mapped_ids)
+message(sprintf("Dropping %d genes with no SYMBOL; keeping %d.",
+                dropped_n, length(mapped_ids)))
+
+# Keep metadata + only the successfully-mapped gene columns
+meta_keep    <- intersect(c("sample", "stage_binary",
+                            "ajcc_pathologic_stage.diagnoses"),
+                          colnames(dataset_expr))
+dataset_expr <- dataset_expr[, c(meta_keep, mapped_ids)]
+
+# Rename the surviving gene columns to their symbols
+current_names <- colnames(dataset_expr)
+new_names     <- ifelse(current_names %in% mapped_ids,
+                        gene_lookup[current_names], current_names)
+colnames(dataset_expr) <- make.unique(new_names)
+
+# Reverse lookup (symbol/colname -> ensembl) so importance output can be traced
+symbol_to_ensembl <- setNames(current_names, colnames(dataset_expr))
+
+###################
+## DATA OVERVIEW ##
+###################
+
+count(dataset_expr, stage_binary) # early = 288, late = 212
+write.xlsx(dataset_expr, "cleaned_before_split.xlsx")
+
+###################
+## DATA SPLITTING ##
+###################
+
+set.seed(SEED)
+
+# 20% held-out test set
+initial_split  <- createDataPartition(dataset_expr$stage_binary, p = 0.80, list = FALSE)
+train_val_pool <- dataset_expr[initial_split, ]
+test_data      <- dataset_expr[-initial_split, ]
+
+# Split the 80% pool into 60% train / 20% validation (0.60 / 0.80 = 0.75)
+train_split <- createDataPartition(train_val_pool$stage_binary, p = 0.75, list = FALSE)
+train_data  <- train_val_pool[train_split, ]
+val_data    <- train_val_pool[-train_split, ]
+
+###################
+## FEATURE SELECTION FUNCTION ##
+###################
+
+select_features <- function(df, gene_cols, n_top = N_TOP_GENES) {
+  scores <- apply(df[, gene_cols, drop = FALSE], 2, sd, na.rm = TRUE)
+  scores <- scores[!is.na(scores)]
+  ranked <- names(sort(scores, decreasing = TRUE))          # high SD 
+  ranked[seq_len(min(n_top, length(ranked)))]
+}
+
+# Full list of candidate gene columns (before any selection)
+gene_cols_all <- setdiff(colnames(train_data), META_COLS)
+
+train_data_full <- train_data
+
+# --- Selection on the FULL training set: used for the final model,
+high_sd_genes <- select_features(train_data, gene_cols_all, n_top = N_TOP_GENES)
+message(sprintf("Feature selection (full train): variance -> kept %d genes.",
+                length(high_sd_genes)))
+
+# Subset all three sets to the SAME full-train-derived genes
+keep_cols  <- c(META_COLS[META_COLS %in% colnames(train_data)], high_sd_genes)
+train_data <- train_data[, keep_cols]
+val_data   <- val_data[,   keep_cols]
+test_data  <- test_data[,  keep_cols]
+
+
+train_data_final <- train_data
+val_data_final   <- val_data
+test_data_final  <- test_data
+
+count(train_data_final, stage_binary) # early = 174, late = 128
+count(val_data_final, stage_binary) # early = 57, late = 42
+count(test_data_final, stage_binary) # early = 57, late = 42
+
+write.csv(train_data_final, "cleaned_train.csv", row.names = FALSE)
+write.csv(val_data_final, "cleaned_validation.csv", row.names = FALSE)
+write.csv(test_data_final, "cleaned_test.csv", row.names = FALSE)
+
+###################
+## FEATURE SELECTION OVERVIEW ##
+###################
+
+max(high_sd_genes)
+min(high_sd_genes)
+
+# training data 
+col_max_train <- sapply(train_data_final[sapply(train_data_final, is.numeric)],
+                        max, na.rm = TRUE)
+
+names(which.max(col_max_train))
+max(col_max_train)
+names(which.min(col_max_train))
+min(col_max_train)
+
+z_scores_train <- (col_max_train - mean(col_max_train, na.rm = TRUE)) /
+  sd(col_max_train, na.rm = TRUE)
+
+names(which.max(z_scores_train))
+max(z_scores_train)
+names(which.min(z_scores_train))
+min(z_scores_train)
+sum(z_scores_train > 2, na.rm = TRUE)
+sum(z_scores_train < -2, na.rm = TRUE)
+
+# validation data 
+col_max_val <- sapply(val_data_final[sapply(val_data_final, is.numeric)],
+                      max, na.rm = TRUE)
+
+names(which.max(col_max_val))
+max(col_max_val)
+names(which.min(col_max_val))
+min(col_max_val)
+
+z_scores_val <- (col_max_val - mean(col_max_val, na.rm = TRUE)) /
+  sd(col_max_val, na.rm = TRUE)
+
+names(which.max(z_scores_val))
+max(z_scores_val)
+names(which.min(z_scores_val))
+min(z_scores_val)
+sum(z_scores_val > 2, na.rm = TRUE)
+sum(z_scores_val < -2, na.rm = TRUE)
+
+# test data 
+col_max_test <- sapply(test_data_final[sapply(test_data_final, is.numeric)],
+                       max, na.rm = TRUE)
+
+names(which.max(col_max_test))
+max(col_max_test)
+names(which.min(col_max_test))
+min(col_max_test)
+
+z_scores_test <- (col_max_test - mean(col_max_test, na.rm = TRUE)) /
+  sd(col_max_test, na.rm = TRUE)
+
+names(which.max(z_scores_test))
+max(z_scores_test)
+names(which.min(z_scores_test))
+min(z_scores_test)
+sum(z_scores_test > 2, na.rm = TRUE)
+sum(z_scores_test < -2, na.rm = TRUE)
+sum(z_scores_test > -0.05 & z_scores_test < 0.05, na.rm = TRUE)
+
+
+###################
+## BALANCING THE DATA ##
+###################
+
+# changing the stage_binary column to a 'factor' so it is more readable by the random forest model
+train_data_final$stage_binary <- as.factor(train_data_final$stage_binary)
+val_data_final$stage_binary   <- as.factor(val_data_final$stage_binary)
+test_data_final$stage_binary  <- as.factor(test_data_final$stage_binary)
+
+x_train <- train_data_final[, high_sd_genes] # values to show the model for prediction
+y_train <- train_data_final$stage_binary # shows the model the results 
+x_val   <- val_data_final[, high_sd_genes] # values to show the model for prediction
+y_val   <- val_data_final$stage_binary # shows the model the results 
+
+# tells the model to treat each classes as equally weighted because early is larger
+make_case_weights <- function(y) {
+  freq <- table(y) # counts each stage
+  w_per_class <- length(y) / (length(freq) * as.numeric(freq)) # the weight of each class 
+  names(w_per_class) <- names(freq) # reattach each the class labels which were stripped by "as.numeric"
+  unname(w_per_class[as.character(y)]) }
+
+###################
+## MCC ##
+###################
+
+mcc <- function(pred, truth, positive = "Late", negative = "Early") {
+  pred  <- as.character(pred);  truth <- as.character(truth)
+  TP <- sum(pred == positive & truth == positive)
+  TN <- sum(pred == negative & truth == negative)
+  FP <- sum(pred == positive & truth == negative)
+  FN <- sum(pred == negative & truth == positive)
+  denom <- sqrt((TP + FP) * (TP + FN) * (TN + FP) * (TN + FN))
+  if (denom == 0) return(0)  # undefined (a row/col of the matrix is all zero)
+  ((TP * TN) - (FP * FN)) / denom}
+
+###################
+## GRID SEARCH ##
+###################
+
+# setting which hyperparameters are used in the grid search
+grid <- expand.grid(
+  mtry          = GRID_MTRY,
+  max_depth     = GRID_MAX_DEPTH,
+  min_node_size = GRID_MIN_NODE_SIZE,
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE)
+grid$mean_mcc <- NA_real_
+grid$mean_f1  <- NA_real_
+grid$mean_auc <- NA_real_
+
+# setting the cross-validation
+y_train_full <- as.factor(train_data_full$stage_binary)
+
+set.seed(SEED)
+folds <- createFolds(y_train_full, k = CV_FOLDS, list = TRUE)
+
+# setting the folds for the cross validation
+fold_cache <- lapply(seq_along(folds), function(f) {
+  val_idx <- folds[[f]]
+  tr <- train_data_full[-val_idx, , drop = FALSE]
+  te <- train_data_full[ val_idx, , drop = FALSE]
+  
+  # feature selection on this fold's TRAINING portion only
+  genes_f <- select_features(tr, gene_cols_all, n_top = N_TOP_GENES)
+  
+  list(
+    x_tr = as.matrix(tr[, genes_f]),
+    y_tr = as.factor(tr$stage_binary),
+    x_te = as.matrix(te[, genes_f]),
+    y_te = as.factor(te$stage_binary))})
+
+# the outer loop
+for (i in seq_len(nrow(grid))) { # uses every combination from the grid search
+  fold_mccs <- numeric(length(folds)) 
+  fold_f1s  <- numeric(length(folds))
+  fold_aucs <- numeric(length(folds))
+  
+  # the inner loop
+  for (f in seq_along(folds)) { # the cross-validation folds 
+    fc <- fold_cache[[f]] 
+    cw <- if (CLASS_WEIGHT == "balanced") make_case_weights(fc$y_tr) else NULL
+    
+    # random forest model
+    fit <- ranger(
+      x = fc$x_tr, y = fc$y_tr,
+      num.trees     = NTREE,
+      mtry          = grid$mtry[i],
+      max.depth     = grid$max_depth[i],
+      min.node.size = grid$min_node_size[i],
+      case.weights  = cw,
+      probability   = TRUE,
+      seed          = SEED + f)
+    prob <- predict(fit, data = fc$x_te)$predictions[, "Late"]
+    pred <- factor(
+      ifelse(prob >= 0.5, "Late", "Early"),
+      levels = c("Early", "Late"))
+    # MCC
+    fold_mccs[f] <- mcc(
+      pred,
+      fc$y_te,
+      positive = "Late",
+      negative = "Early")
+    # F1-score
+    cm <- confusionMatrix(
+      pred,
+      fc$y_te,
+      positive = "Late")
+    fold_f1s[f] <- as.numeric(cm$byClass["F1"])
+    # ROC-AUC
+    roc_obj <- pROC::roc(
+      response = fc$y_te,
+      predictor = prob,
+      levels = c("Early", "Late"),
+      direction = "<",
+      quiet = TRUE)
+    fold_aucs[f] <- as.numeric(pROC::auc(roc_obj))}
+  grid$mean_mcc[i] <- mean(fold_mccs)
+  grid$mean_f1[i]  <- mean(fold_f1s)
+  grid$mean_auc[i] <- mean(fold_aucs)
+  message(sprintf(
+    "[%2d/%d] mtry=%3d depth=%2d node=%2d | MCC=%.3f | F1=%.3f | AUC=%.3f",
+    i, nrow(grid),
+    grid$mtry[i],
+    grid$max_depth[i],
+    grid$min_node_size[i],
+    grid$mean_mcc[i],
+    grid$mean_f1[i],
+    grid$mean_auc[i]))}
+
+# final grid order 
+grid_sorted <- grid[order(-grid$mean_mcc,      # 1. best CV MCC first
+                          grid$max_depth,       # 2. prefer shallower trees
+                          -grid$min_node_size,  # 3. then larger leaves
+                          grid$mtry), ]         # 4. then fewer features/split
+print(grid_sorted)
+
+best <- grid_sorted[1, ]
+message(sprintf("Best: mtry=%d, max.depth=%d, min.node.size=%d (CV MCC=%.3f)",
+                best$mtry, best$max_depth, best$min_node_size, best$mean_mcc))
+
+###################
+## OPTIMISED RANDOM FOREST MODEL ##
+###################
+
+final_cw <- if (CLASS_WEIGHT == "balanced") make_case_weights(y_train) else NULL
+
+set.seed(SEED)
+rf_model <- ranger(
+  x = x_train, y = y_train,
+  num.trees     = NTREE,
+  mtry          = best$mtry,
+  max.depth     = best$max_depth,
+  min.node.size = best$min_node_size,
+  case.weights  = final_cw,
+  probability   = TRUE,
+  importance    = "impurity",
+  seed          = SEED)
+print(rf_model)
+
+###################
+## VALIDATION-SET EVALUATION ##
+###################
+
+val_prob <- predict(rf_model, data = x_val)$predictions[, "Late"] # using the late probability for each validation sample
+val_pred <- factor(ifelse(val_prob >= 0.5, "Late", "Early"),
+                   levels = c("Early", "Late"))
+
+# confusion matrix for the validation data
+val_cm <- confusionMatrix(val_pred, y_val, positive = "Late")  
+print(val_cm) # extra results 
+
+# MCC
+val_mcc <- mcc(val_pred, y_val, positive = "Late", negative = "Early") 
+message(sprintf("Validation MCC = %.3f", val_mcc))
+
+# F1-score (for the positive "Late" class) from the confusion matrix
+val_f1 <- as.numeric(val_cm$byClass["F1"])
+message(sprintf("Validation F1 = %.3f", val_f1))
+
+# Secondary diagnostics: ROC / AUC
+val_roc <- pROC::roc(response = y_val, predictor = val_prob,
+                     levels = c("Early", "Late"), direction = "<")
+message(sprintf("Validation AUC = %.3f (secondary)", as.numeric(pROC::auc(val_roc))))
+
+plot(val_roc, col = "#2C3E50", lwd = 2,
+     main = sprintf("Validation ROC (AUC = %.3f)", as.numeric(pROC::auc(val_roc))))
+abline(a = 0, b = 1, lty = 2, col = "grey60")
+
+# Top 20 genes by importance
+imp <- ranger::importance(rf_model)
+imp_df <- data.frame(gene = names(imp),
+                     Importance = as.numeric(imp)) %>%
+  mutate(ensembl = symbol_to_ensembl[gene]) %>%
+  arrange(desc(Importance))
+
+print(head(imp_df, 20))
+
+###################
+## SVM: NESTED-CV GRID SEARCH ##
+###################
+
+# Named class-weight vector (svm wants weights per class label, not per row)
+svm_class_weights <- function(y) {
+  freq <- table(y)
+  w <- length(y) / (length(freq) * as.numeric(freq))
+  setNames(w, names(freq))}
+
+# Building the SVM grid:
+svm_grid <- do.call(rbind, lapply(SVM_KERNELS, function(k) { # runs every kernel for each hyperparameter
+  if (k == "linear") { 
+    expand.grid(kernel = k, cost = SVM_COST, gamma = NA_real_, # do not use gamma for linear 
+                stringsAsFactors = FALSE) 
+  } else {
+    expand.grid(kernel = k, cost = SVM_COST, gamma = SVM_GAMMA,
+                stringsAsFactors = FALSE)}}))
+svm_grid$mean_mcc <- NA_real_ # creating empty results ready for the grid search
+svm_grid$mean_f1  <- NA_real_
+svm_grid$mean_auc <- NA_real_
+
+# grid search
+for (i in seq_len(nrow(svm_grid))) { 
+  fold_mccs <- numeric(length(folds))
+  fold_f1s  <- numeric(length(folds))
+  fold_aucs <- numeric(length(folds))
+  
+  for (f in seq_along(folds)) {
+    fc <- fold_cache[[f]]
+    cw <- if (CLASS_WEIGHT == "balanced") svm_class_weights(fc$y_tr) else NULL
+    
+    # SVM model
+    svm_grid_search <- list(
+      x = fc$x_tr, y = fc$y_tr,
+      kernel = svm_grid$kernel[i],
+      cost   = svm_grid$cost[i],
+      class.weights = cw,
+      probability   = TRUE,
+      scale         = FALSE )
+    if (svm_grid$kernel[i] == "radial") svm_grid_search$gamma <- svm_grid$gamma[i]
+    fit <- do.call(e1071::svm, svm_grid_search)
+    # Class predictions
+    pred <- predict(fit, fc$x_te, probability = TRUE)
+    # Predicted probabilities
+    prob <- attr(pred, "probabilities")[, "Late"]
+    # MCC
+    fold_mccs[f] <- mcc(
+      pred,
+      fc$y_te,
+      positive = "Late",
+      negative = "Early")
+    # F1-score
+    cm <- confusionMatrix(
+      pred,
+      fc$y_te,
+      positive = "Late")
+    fold_f1s[f] <- as.numeric(cm$byClass["F1"])
+    # ROC-AUC
+    roc_obj <- pROC::roc(
+      response = fc$y_te,
+      predictor = prob,
+      levels = c("Early", "Late"),
+      direction = "<",
+      quiet = TRUE)
+    fold_aucs[f] <- as.numeric(pROC::auc(roc_obj))}
+  svm_grid$mean_mcc[i] <- mean(fold_mccs)
+  svm_grid$mean_f1[i]  <- mean(fold_f1s)
+  svm_grid$mean_auc[i] <- mean(fold_aucs)
+  message(sprintf(
+    "[SVM %2d/%d] kernel=%-6s cost=%-5g gamma=%-6s | MCC=%.3f | F1=%.3f | AUC=%.3f",
+    i,
+    nrow(svm_grid),
+    svm_grid$kernel[i],
+    svm_grid$cost[i],
+    ifelse(is.na(svm_grid$gamma[i]), "-", svm_grid$gamma[i]),
+    svm_grid$mean_mcc[i],
+    svm_grid$mean_f1[i],
+    svm_grid$mean_auc[i]))} 
+
+# Sorted best-first. 
+svm_grid_sorted <- svm_grid[order(-svm_grid$mean_mcc,  # 1. best CV MCC
+                                  svm_grid$cost,        # 2. smaller cost
+                                  svm_grid$gamma), ]    # 3. smaller gamma
+print(svm_grid_sorted)
+
+svm_best <- svm_grid_sorted[1, ]
+message(sprintf("Best SVM: kernel=%s, cost=%g, gamma=%s (CV MCC=%.3f)",
+                svm_best$kernel, svm_best$cost,
+                ifelse(is.na(svm_best$gamma), "-", svm_best$gamma),
+                svm_best$mean_mcc))
+
+###################
+## SVM FINAL MODEL ##
+###################
+
+svm_cw <- if (CLASS_WEIGHT == "balanced") svm_class_weights(y_train) else NULL
+
+# SVM model 
+svm_op <- list(
+  x = x_train, y = y_train,
+  kernel = svm_best$kernel,
+  cost   = svm_best$cost,
+  class.weights = svm_cw,
+  probability   = TRUE,
+  scale         = FALSE)
+if (svm_best$kernel == "radial") svm_op$gamma <- svm_best$gamma
+
+set.seed(SEED)
+svm_model <- do.call(e1071::svm, svm_op)
+
+###################
+## SVM: VALIDATION-SET EVALUATION ##
+###################
+
+svm_val_pred <- predict(svm_model, x_val, probability = TRUE)
+# Probability of "Late" for ROC/threshold work
+svm_val_prob <- attr(svm_val_pred, "probabilities")[, "Late"]
+svm_val_pred <- factor(as.character(svm_val_pred), levels = c("Early", "Late"))
+
+# confusion matrix
+svm_val_cm <- confusionMatrix(svm_val_pred, y_val, positive = "Late")
+print(svm_val_cm)
+
+# mcc
+svm_val_mcc <- mcc(svm_val_pred, y_val, positive = "Late", negative = "Early")
+message(sprintf("SVM Validation MCC = %.3f", svm_val_mcc))
+
+# f1-score
+svm_val_f1 <- as.numeric(svm_val_cm$byClass["F1"])
+message(sprintf("SVM Validation F1 = %.3f", svm_val_f1))
+
+svm_val_roc <- pROC::roc(response = y_val, predictor = svm_val_prob,
+                         levels = c("Early", "Late"), direction = "<")
+message(sprintf("SVM Validation AUC = %.3f (secondary)",
+                as.numeric(pROC::auc(svm_val_roc))))
+
+###################
+## MODEL COMPARISON ##
+###################
+
+comparison <- data.frame(
+  model        = c("RandomForest", "SVM"),
+  cv_mcc       = c(best$mean_mcc, svm_best$mean_mcc),
+  val_mcc      = c(val_mcc, svm_val_mcc),
+  val_f1       = c(val_f1, svm_val_f1),
+  val_auc      = c(as.numeric(pROC::auc(val_roc)),
+                   as.numeric(pROC::auc(svm_val_roc))))
+print(comparison)
+message(sprintf("Higher validation MCC: %s",
+                comparison$model[which.max(comparison$val_mcc)]))
+
+###################
+## FINAL TEST-SET EVALUATION (held-out 20%) ##
+###################
+
+x_test <- test_data_final[, high_sd_genes] # taking only the top sd genes 
+y_test <- test_data_final$stage_binary # gets the labels 
+
+winner <- comparison$model[which.max(comparison$val_mcc)] 
+message(sprintf("Pre-selected (validation) final model: %s", winner))
+
+# "Late" probabilities on the test set, per model
+rf_test_prob  <- predict(rf_model, data = x_test)$predictions[, "Late"] 
+svm_test_raw  <- predict(svm_model, x_test, probability = TRUE)
+svm_test_prob <- attr(svm_test_raw, "probabilities")[, "Late"]
+
+# judged by identical rules 
+evaluate_test <- function(prob, model_name, roc_col) {
+  pred <- factor(ifelse(prob >= 0.5, "Late", "Early"), levels = c("Early", "Late")) # 0.5 threshold 
+  confmatrix   <- confusionMatrix(pred, y_test, positive = "Late") # confusion matrix
+  cat(sprintf("\n=== TEST SET: %s ===\n", model_name)) 
+  print(confmatrix)
+  m   <- mcc(pred, y_test, positive = "Late", negative = "Early") # mcc
+  f1  <- as.numeric(confmatrix$byClass["F1"]) # f1 score
+  roc <- pROC::roc(response = y_test, predictor = prob, # roc/auc value
+                   levels = c("Early", "Late"), direction = "<")
+  a   <- as.numeric(pROC::auc(roc))  # roc/auc value
+  message(sprintf("%s Test MCC = %.3f | F1 = %.3f | AUC = %.3f", model_name, m, f1, a))
+  plot(roc, col = roc_col, lwd = 2,
+       main = sprintf("%s Test ROC (AUC = %.3f)", model_name, a))
+  abline(a = 0, b = 1, lty = 2, col = "grey60")
+  list(confmatrix = confmatrix, mcc = m, f1 = f1, auc = a, roc = roc)}
+
+rf_test  <- evaluate_test(rf_test_prob,  "RandomForest", "#2C3E50")
+svm_test <- evaluate_test(svm_test_prob, "SVM",          "#8E44AD")
+
+# Keep the winner's numbers under generic names for the SHAP section below.
+if (winner == "RandomForest") {
+  test_prob <- rf_test_prob;  test_mcc <- rf_test$mcc;  test_auc <- rf_test$auc
+} else {
+  test_prob <- svm_test_prob; test_mcc <- svm_test$mcc; test_auc <- svm_test$auc}
+
+# --- Final summary: validation vs test for BOTH models ---
+final_summary <- data.frame(
+  model    = c("RandomForest", "SVM"),
+  val_mcc  = comparison$val_mcc,
+  val_f1   = comparison$val_f1,
+  val_auc  = comparison$val_auc,
+  test_mcc = c(rf_test$mcc, svm_test$mcc),
+  test_f1  = c(rf_test$f1,  svm_test$f1),
+  test_auc = c(rf_test$auc, svm_test$auc))
+print(final_summary)
+message(sprintf("Headline result = %s (pre-selected on validation).", winner))
+
+###################
+## SHAP ANALYSIS (both models, held-out test set) ##
+###################
+
+shap_genes <- head(imp_df$gene, SHAP_N_GENES) # top 20 genes 
+shap_genes <- intersect(shap_genes, high_sd_genes)   # genes that only appear in top 2000 sd 
+
+X_explain <- as.data.frame(x_test)[, shap_genes, drop = FALSE] # SHAP cut-down to 20 genes 
+
+set.seed(SEED)
+bg_idx <- sample(nrow(x_train), min(SHAP_BG_SIZE, nrow(x_train))) # reduced to 50 for faster analysis
+bg_X   <- as.data.frame(x_train)[bg_idx, shap_genes, drop = FALSE] # reduced to 20
+
+gene_baseline <- colMeans(as.matrix(x_train))[high_sd_genes] # converting numbers to matrix 
+stopifnot(!any(is.na(gene_baseline)),
+          identical(names(gene_baseline), high_sd_genes)) # stops if the top 20 genes are not changed with SHAP and if there are any na values 
+
+# Run the full Kernel SHAP 
+run_shap_svm <- function(model, model_type, label) {
+  
+  predict_late <- function(object, newdata) {
+    full <- matrix(rep(gene_baseline, each = nrow(newdata)),
+                   nrow = nrow(newdata), ncol = length(high_sd_genes),
+                   dimnames = list(NULL, high_sd_genes)) # all 2000 genes = training mean
+    keep <- intersect(colnames(newdata), high_sd_genes) # the 20 explained genes
+    full[, keep] <- as.matrix(newdata[, keep, drop = FALSE]) # the 20 explained genes
+    full <- as.data.frame(full)
+    
+    p <- predict(object, full, probability = TRUE)
+    attr(p, "probabilities")[, "Late"]}
+  
+  ks <- kernelshap::kernelshap(
+    object   = model,
+    X        = X_explain,
+    bg_X     = bg_X,
+    pred_fun = predict_late)
+  sv <- shapviz::shapviz(ks)
+  
+  # mean SHAP per gene
+  svm_bar <- shapviz::sv_importance(
+    sv,
+    kind = "bar",
+    max_display = SHAP_N_GENES) +
+    ggplot2::labs(
+      x = "SHAPley value",
+      y = "Gene")
+  svm_bar$layers[[1]]$aes_params$fill <- "steelblue"
+  print(svm_bar)
+  
+  # Beeswarm, positive is late and negative is early
+  print(shapviz::sv_importance(sv, kind = "beeswarm", max_display = "SHAPley Value") +
+          ggplot2::labs(title = sprintf("SHAPley (%s, test set)", label)))
+  
+  # Tabular mean SHAP ranking, traced back to Ensembl IDs
+  shap_mat <- shapviz::get_shap_values(sv)
+  imp <- data.frame(
+    gene          = colnames(shap_mat),
+    mean_abs_shap = colMeans(abs(shap_mat))) %>%
+    mutate(ensembl = symbol_to_ensembl[gene]) %>%
+    arrange(desc(mean_abs_shap))
+  
+  cat(sprintf("\n=== SHAPley importance: %s (test set) ===\n", label))
+  print(imp)
+  
+  list(sv = sv, importance = imp)}
+
+run_treeshap <- function(surrogate, train_X, explain_X, genes, label) {
+  unified <- treeshap::ranger.unify(surrogate, train_X)
+  ts      <- treeshap::treeshap(unified, explain_X, verbose = FALSE)
+  sv_full <- shapviz::shapviz(ts, X = explain_X) # SHAP over all genes
+  sv      <- sv_full[, genes] # subset to display genes
+  
+  # mean SHAP per gene
+  rf_bar <- shapviz::sv_importance(
+    sv,
+    kind = "bar",
+    max_display = SHAP_N_GENES) +
+    ggplot2::labs(
+      x = "SHAPley value",
+      y = "Gene")
+  rf_bar$layers[[1]]$aes_params$fill <- "steelblue"
+  print(rf_bar)
+  
+  # Beeswarm, positive is late and negative is early
+  print(shapviz::sv_importance(sv, kind = "beeswarm", max_display = "SHAPley Value") +
+          ggplot2::labs(title = sprintf("SHAPley (%s, test set)", label)))
+  
+  shap_mat <- shapviz::get_shap_values(sv)
+  imp <- data.frame(
+    gene          = colnames(shap_mat),
+    mean_abs_shap = colMeans(abs(shap_mat))) %>%
+    mutate(ensembl = symbol_to_ensembl[gene]) %>%
+    arrange(desc(mean_abs_shap))
+  
+  cat(sprintf("\n=== SHAPley importance: %s (treeshap, test set) ===\n", label))
+  print(imp)
+  
+  list(sv = sv, importance = imp, sv_full = sv_full)}
+
+# random forest regression surrogate with 99% similarity 
+set.seed(SEED)
+rf_surrogate <- ranger(
+  x = x_train, y = as.integer(y_train == "Late"),
+  num.trees     = NTREE,
+  mtry          = best$mtry,
+  max.depth     = best$max_depth,
+  min.node.size = best$min_node_size,
+  case.weights  = final_cw,
+  seed          = SEED)
+
+# Fidelity of surrogate
+rf_surrogate_fit <- predict(rf_surrogate, data = x_test)$predictions
+rf_prob_fit      <- predict(rf_model,     data = x_test)$predictions[, "Late"]
+message(sprintf("treeshap surrogate fidelity: cor(P_Late) = %.4f (test set).",
+                cor(rf_surrogate_fit, rf_prob_fit)))
+
+rf_shap  <- run_treeshap(rf_surrogate, x_train, x_test, shap_genes, "RandomForest")
+
+# kernelshap on SVM
+svm_shap <- run_shap_svm(svm_model, "SVM", "SVM")
+
+# states the winner so later code does not need to keep checking which model won 
+if (winner == "RandomForest") {
+  sv <- rf_shap$sv;  shap_importance <- rf_shap$importance
+} else {
+  sv <- svm_shap$sv; shap_importance <- svm_shap$importance}
